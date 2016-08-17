@@ -315,7 +315,7 @@ TEST(test_resource_pool, copy_assignment)
     auto o2 = pool.allocate();
 
     o1.reset();
-
+    
     recycle::resource_pool<dummy_one> new_pool;
     new_pool = pool;
 
@@ -477,4 +477,33 @@ TEST(test_resource_pool, enable_shared_from_this)
     }
 
     EXPECT_EQ(dummy_three::m_count, 0);
+}
+
+//Test capacity
+TEST(test_resource_pool, capacity)
+{
+    {
+        recycle::resource_pool<dummy_one> pool(3);
+
+        EXPECT_EQ(pool.unused_resources(), 0U);
+
+        auto d1 = pool.allocate();
+        auto d2 = pool.allocate();
+        auto d3 = pool.allocate();
+        auto d4 = pool.allocate();
+        EXPECT_EQ(pool.unused_resources(), 0U);
+        EXPECT_EQ(dummy_one::m_count, 4);
+
+        d1.reset();
+        d2.reset();
+        d3.reset();
+        EXPECT_EQ(pool.unused_resources(), 3U);
+        EXPECT_EQ(dummy_one::m_count, 4);
+
+        d4.reset();
+        EXPECT_EQ(pool.unused_resources(), 3U);
+        EXPECT_EQ(dummy_one::m_count, 3);
+    }
+
+    EXPECT_EQ(dummy_one::m_count, 0);
 }

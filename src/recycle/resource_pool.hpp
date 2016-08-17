@@ -9,10 +9,11 @@
 #include <cassert>
 #include <cstdint>
 #include <functional>
-#include <list>
+#include <vector>
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <cstdlib> 
 
 #include "no_locking_policy.hpp"
 
@@ -53,6 +54,8 @@ namespace recycle
         /// The locking policy lock type
         using lock_type = typename LockingPolicy::lock_type;
 
+        static const std::size_t DEFAULT_CAPACITY = 10000;
+
     public:
 
         /// Default constructor, we only want this to be available
@@ -76,24 +79,24 @@ namespace recycle
             typename std::enable_if<
                 std::is_default_constructible<T>::value, uint8_t>::type = 0
         >
-        resource_pool() :
+        resource_pool(std::size_t capacity = DEFAULT_CAPACITY) :
             m_pool(std::make_shared<impl>(
-                       allocate_function(std::make_shared<value_type>)))
+                       allocate_function(std::make_shared<value_type>), capacity))
         { }
 
         /// Create a resource pool using a specific allocate function.
         /// @param allocate Allocation function
-        resource_pool(allocate_function allocate) :
-            m_pool(std::make_shared<impl>(std::move(allocate)))
+        resource_pool(allocate_function allocate, std::size_t capacity = DEFAULT_CAPACITY) :
+            m_pool(std::make_shared<impl>(std::move(allocate), capacity))
         { }
 
         /// Create a resource pool using a specific allocate function and
         /// recycle function.
         /// @param allocate Allocation function
         /// @param recycle Recycle function
-        resource_pool(allocate_function allocate, recycle_function recycle) :
+        resource_pool(allocate_function allocate, recycle_function recycle, std::size_t capacity = DEFAULT_CAPACITY) :
             m_pool(std::make_shared<impl>(std::move(allocate),
-                                          std::move(recycle)))
+                                          std::move(recycle), capacity))
         { }
 
         /// Copy constructor
@@ -124,7 +127,7 @@ namespace recycle
         }
 
         /// @returns the number of unused resources
-        uint32_t unused_resources() const
+        std::size_t unused_resources() const
         {
             assert(m_pool);
             return m_pool->unused_resources();
@@ -154,20 +157,24 @@ namespace recycle
         struct impl : public std::enable_shared_from_this<impl>
         {
             /// @copydoc resource_pool::resource_pool(allocate_function)
-            impl(allocate_function allocate) :
+            impl(allocate_function allocate, std::size_t capacity) :
                 m_allocate(std::move(allocate))
             {
                 assert(m_allocate);
+                m_free_vector.reserve(capacity);
+                m_free_vector_control_blocks.reserve(capacity);
             }
 
             /// @copydoc resource_pool::resource_pool(allocate_function,
             ///                                       recycle_function)
-            impl(allocate_function allocate, recycle_function recycle) :
+            impl(allocate_function allocate, recycle_function recycle, std::size_t capacity) :
                 m_allocate(std::move(allocate)),
                 m_recycle(std::move(recycle))
             {
                 assert(m_allocate);
                 assert(m_recycle);
+                m_free_vector.reserve(capacity);
+                m_free_vector_control_blocks.reserve(capacity);
             }
 
             /// Copy constructor
@@ -176,10 +183,12 @@ namespace recycle
                 m_allocate(other.m_allocate),
                 m_recycle(other.m_recycle)
             {
+                m_free_vector.reserve(other.m_free_vector.capacity());
+                m_free_vector_control_blocks.reserve(other.m_free_vector_control_blocks.capacity());
                 uint32_t size = other.unused_resources();
                 for (uint32_t i = 0; i < size; ++i)
                 {
-                    m_free_list.push_back(m_allocate());
+                    m_free_vector.push_back(m_allocate());
                 }
             }
 
@@ -188,8 +197,17 @@ namespace recycle
                 std::enable_shared_from_this<impl>(other),
                 m_allocate(std::move(other.m_allocate)),
                 m_recycle(std::move(other.m_recycle)),
-                m_free_list(std::move(other.m_free_list))
+                m_free_vector(std::move(other.m_free_vector)),
+                m_free_vector_control_blocks(std::move(other.m_free_vector_control_blocks))
             { }
+
+            ~impl()
+            {
+                m_free_vector.clear();
+                for (void* p : m_free_vector_control_blocks)
+                    std::free(p);
+                m_free_vector_control_blocks.clear();
+            }
 
             /// Copy assignment
             impl& operator=(const impl& other)
@@ -204,7 +222,8 @@ namespace recycle
             {
                 m_allocate = std::move(other.m_allocate);
                 m_recycle = std::move(other.m_recycle);
-                m_free_list = std::move(other.m_free_list);
+                m_free_vector = std::move(other.m_free_vector);
+                m_free_vector_control_blocks = std::move(other.m_free_vector_control_blocks);
                 return *this;
             }
 
@@ -212,14 +231,20 @@ namespace recycle
             value_ptr allocate()
             {
                 value_ptr resource;
+                value_ptr result;
+
+                auto pool = impl::shared_from_this();
 
                 {
                     lock_type lock(m_mutex);
 
-                    if (m_free_list.size() > 0)
+                    if (m_free_vector.size() > 0)
                     {
-                        resource = m_free_list.back();
-                        m_free_list.pop_back();
+                        resource = m_free_vector.back();
+                        m_free_vector.pop_back();
+
+                        // The allocator's value_type doesn't matter, will rebind it anyway. (See: shared_ptr_base.h : 468)
+                        result = value_ptr(resource.get(), deleter(pool, resource), SimpleAllocator<void>(true, m_free_vector_control_blocks, m_mutex));
                     }
                 }
 
@@ -227,9 +252,10 @@ namespace recycle
                 {
                     assert(m_allocate);
                     resource = m_allocate();
-                }
 
-                auto pool = impl::shared_from_this();
+                    // The allocator's value_type doesn't matter, will rebind it anyway. (See: shared_ptr_base.h : 468)
+                    result = value_ptr(resource.get(), deleter(pool, resource), SimpleAllocator<void>(false, m_free_vector_control_blocks, m_mutex));
+                }
 
                 // Here we create a std::shared_ptr<T> with a naked
                 // pointer to the resource and a custom deleter
@@ -245,21 +271,25 @@ namespace recycle
                 //   2. A std::shared_ptr<T> that points to the actual
                 //      resource and is the one actually keeping it alive.
 
-                return value_ptr(resource.get(), deleter(pool, resource));
+                // The allocator's value_type doesn't matter, will rebind it anyway. (See: shared_ptr_base.h : 468)
+                return result; 
             }
 
             /// @copydoc resource_pool::free_unused()
             void free_unused()
             {
                 lock_type lock(m_mutex);
-                m_free_list.clear();
+                m_free_vector.clear();
+                for (void* p : m_free_vector_control_blocks)
+                    std::free(p);
+                m_free_vector_control_blocks.clear();
             }
 
             /// @copydoc resource_pool::unused_resources()
-            uint32_t unused_resources() const
+            std::size_t unused_resources() const
             {
                 lock_type lock(m_mutex);
-                return static_cast<uint32_t>(m_free_list.size());
+                return m_free_vector.size();
             }
 
             /// This function called when a resource should be added
@@ -272,10 +302,66 @@ namespace recycle
                 }
 
                 lock_type lock(m_mutex);
-                m_free_list.push_back(resource);
+                if (m_free_vector.size() < m_free_vector.capacity())
+                    m_free_vector.push_back(resource);
             }
 
         private:
+
+            using control_block_ptr = void*;
+
+            template <class T>
+            struct SimpleAllocator {
+                typedef T value_type;
+
+                SimpleAllocator(bool should_take_cached, std::vector<control_block_ptr>& free_vector_control_blocks, mutex_type& mutex)
+                    : m_should_take_cached(should_take_cached)
+                    , m_free_vector_control_blocks(free_vector_control_blocks)
+                    , m_mutex(mutex)
+                {}
+
+                template <class U> 
+                SimpleAllocator(const SimpleAllocator<U>& other)
+                    : m_should_take_cached(other.m_should_take_cached)
+                    , m_free_vector_control_blocks(other.m_free_vector_control_blocks)
+                    , m_mutex(other.m_mutex) 
+                {}
+
+                T* allocate(std::size_t n) 
+                {
+                    if (m_should_take_cached && !m_free_vector_control_blocks.empty())
+                    {
+                        auto result = m_free_vector_control_blocks.back();
+                        m_free_vector_control_blocks.pop_back();
+                        return (T*)result;
+                    }
+                    else
+                    {
+                        return (T*)std::malloc(n * sizeof(T));
+                    }
+                }
+
+                void deallocate(T* p, std::size_t)
+                {
+                    bool shouldFree = true;
+                    {
+                        lock_type lock(m_mutex);
+                        if (m_free_vector_control_blocks.size() < m_free_vector_control_blocks.capacity())
+                        {
+                            m_free_vector_control_blocks.push_back(p);
+                            shouldFree = false;
+                        }
+                    }
+                    
+                    if (shouldFree) {
+                        std::free(p);
+                    }
+                }
+
+                const bool m_should_take_cached;
+                std::vector<control_block_ptr>& m_free_vector_control_blocks;
+                mutex_type& m_mutex;
+            };
 
             /// The allocator to use
             allocate_function m_allocate;
@@ -284,7 +370,9 @@ namespace recycle
             recycle_function m_recycle;
 
             /// Stores all the free resources
-            std::list<value_ptr> m_free_list;
+            std::vector<value_ptr> m_free_vector;
+
+            std::vector<control_block_ptr> m_free_vector_control_blocks;
 
             /// Mutex used to coordinate access to the pool. We had to
             /// make it mutable as we have to lock in the
