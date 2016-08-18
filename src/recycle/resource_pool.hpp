@@ -244,7 +244,7 @@ namespace recycle
                         m_free_vector.pop_back();
 
                         // The allocator's value_type doesn't matter, will rebind it anyway. (See: shared_ptr_base.h : 468)
-                        result = value_ptr(resource.get(), deleter(pool, resource), SimpleAllocator<void>(true, m_free_vector_control_blocks, m_mutex));
+                        result = value_ptr(resource.get(), deleter(pool, resource), SimpleAllocator<void>(true, pool));
                     }
                 }
 
@@ -254,7 +254,7 @@ namespace recycle
                     resource = m_allocate();
 
                     // The allocator's value_type doesn't matter, will rebind it anyway. (See: shared_ptr_base.h : 468)
-                    result = value_ptr(resource.get(), deleter(pool, resource), SimpleAllocator<void>(false, m_free_vector_control_blocks, m_mutex));
+                    result = value_ptr(resource.get(), deleter(pool, resource), SimpleAllocator<void>(false, pool));
                 }
 
                 // Here we create a std::shared_ptr<T> with a naked
@@ -314,53 +314,51 @@ namespace recycle
             struct SimpleAllocator {
                 typedef T value_type;
 
-                SimpleAllocator(bool should_take_cached, std::vector<control_block_ptr>& free_vector_control_blocks, mutex_type& mutex)
+                SimpleAllocator(bool should_take_cached, const std::weak_ptr<impl>& pool)
                     : m_should_take_cached(should_take_cached)
-                    , m_free_vector_control_blocks(free_vector_control_blocks)
-                    , m_mutex(mutex)
+                    , m_pool_weak_ptr(pool)
                 {}
 
                 template <class U> 
                 SimpleAllocator(const SimpleAllocator<U>& other)
                     : m_should_take_cached(other.m_should_take_cached)
-                    , m_free_vector_control_blocks(other.m_free_vector_control_blocks)
-                    , m_mutex(other.m_mutex) 
+                    , m_pool_weak_ptr(other.m_pool_weak_ptr)
                 {}
 
                 T* allocate(std::size_t n) 
                 {
-                    if (m_should_take_cached && !m_free_vector_control_blocks.empty())
                     {
-                        auto result = m_free_vector_control_blocks.back();
-                        m_free_vector_control_blocks.pop_back();
-                        return (T*)result;
+                        auto pool = m_pool_weak_ptr.lock();
+                        if (m_should_take_cached && pool && !pool->m_free_vector_control_blocks.empty())
+                        {
+                            auto result = pool->m_free_vector_control_blocks.back();
+                            pool->m_free_vector_control_blocks.pop_back();
+                            return (T*)result;
+                        }
                     }
-                    else
-                    {
-                        return (T*)std::malloc(n * sizeof(T));
-                    }
+
+                    return (T*)std::malloc(n * sizeof(T));
                 }
 
                 void deallocate(T* p, std::size_t)
                 {
-                    bool shouldFree = true;
                     {
-                        lock_type lock(m_mutex);
-                        if (m_free_vector_control_blocks.size() < m_free_vector_control_blocks.capacity())
-                        {
-                            m_free_vector_control_blocks.push_back(p);
-                            shouldFree = false;
+                        auto pool = m_pool_weak_ptr.lock();
+                        if (pool) {
+                            lock_type lock(pool->m_mutex);
+                            if (pool->m_free_vector_control_blocks.size() < pool->m_free_vector_control_blocks.capacity())
+                            {
+                                pool->m_free_vector_control_blocks.push_back(p);
+                                return;
+                            }
                         }
                     }
-                    
-                    if (shouldFree) {
-                        std::free(p);
-                    }
+
+                    std::free(p);
                 }
 
                 const bool m_should_take_cached;
-                std::vector<control_block_ptr>& m_free_vector_control_blocks;
-                mutex_type& m_mutex;
+                std::weak_ptr<impl> m_pool_weak_ptr;
             };
 
             /// The allocator to use
